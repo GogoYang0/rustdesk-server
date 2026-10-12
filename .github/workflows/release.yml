@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: 解析版本号
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 glibc（原生）
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            need_target: false
+            apt: ''
+            musl: false
+            linker: ''
+            archive: linux-amd64
+          # amd64 musl（静态链接）
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            need_target: true
+            apt: 'musl-tools'
+            musl: true
+            linker: 'musl-gcc'
+            archive: linux-amd64-musl
+          # arm64 glibc（原生 arm runner）
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            need_target: false
+            apt: ''
+            musl: false
+            linker: ''
+            archive: linux-arm64
+          # arm64 musl（arm 原生 + musl-gcc）
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            need_target: true
+            apt: 'musl-tools'
+            musl: true
+            linker: 'musl-gcc'
+            archive: linux-arm64-musl
+          # armv7 glibc（arm64 机器交叉编译）
+          - os: ubuntu-24.04-arm
+            target: armv7-unknown-linux-gnueabihf
+            need_target: true
+            apt: 'gcc-arm-linux-gnueabihf'
+            musl: false
+            linker: 'arm-linux-gnueabihf-gcc'
+            archive: linux-armv7
+    runs-on: ${{ matrix.os }}
+    env:
+      # sqlx 宏在编译期按 DATABASE_URL 校验 SQL，数据库文件已随仓库提交
+      DATABASE_URL: sqlite://./db_v2.sqlite3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.need_target == true && matrix.target || '' }}
+
+      - name: 安装交叉工具链
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: 构建 hbbs / hbbr / rustdesk-utils
+        run: |
+          T=${{ matrix.target }}
+          if [ "${{ matrix.need_target }}" = "true" ]; then
+            rustup target add "$T"
+          fi
+          # C 依赖（vendored OpenSSL / bundled sqlite）按目标平台指定编译器与链接器
+          if [ -n "${{ matrix.linker }}" ]; then
+            LU=$(echo "$T" | tr '-' '_' | tr 'a-z' 'A-Z')
+            LL=$(echo "$T" | tr '-' '_')
+            # cargo 仅识别大写形式的 target linker 变量
+            export CARGO_TARGET_${LU}_LINKER="${{ matrix.linker }}"
+            # cc crate 大小写均接受，双写以覆盖 vendored OpenSSL 等构建脚本
+            export CC_${LL}="${{ matrix.linker }}"
+            export CC_${LU}="${{ matrix.linker }}"
+            export AR_${LL}=ar
+            export AR_${LU}=ar
+          fi
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            # musl 下禁用 C++ 相关探测，避免缺 musl-g++
+            export CXX_${T//-/_}=""
+            export OPENSSL_NO_ASM=1
+          fi
+          if [ "${{ matrix.need_target }}" = "true" ]; then
+            cargo build --release --target "$T"
+          else
+            cargo build --release
+          fi
+
+      - name: 打包产物
+        run: |
+          mkdir -p out
+          NAME=rustdesk-server-${{ matrix.archive }}
+          mkdir -p "$NAME"
+          for bin in hbbs hbbr rustdesk-utils; do
+            if [ "${{ matrix.need_target }}" = "true" ]; then
+              cp "target/${{ matrix.target }}/release/$bin" "$NAME/"
+            else
+              cp "target/release/$bin" "$NAME/"
+            fi
+          done
+          tar -czf "out/${NAME}.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.archive }}
+          path: out/*
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: 生成校验和
+        working-directory: out
+        run: |
+          rm -f SHA256SUMS.txt
+          sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ARGS=(--title "rustdesk-server v${VERSION}")
+          gh release create "v${VERSION}" out/* "${ARGS[@]}" --generate-notes \
+            || gh release upload "v${VERSION}" out/* --clobber
